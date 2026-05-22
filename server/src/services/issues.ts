@@ -212,6 +212,7 @@ export function deriveIssueCommentRunLogAttribution(
 export interface IssueFilters {
   attention?: "blocked";
   status?: string;
+  identifier?: string;
   assigneeAgentId?: string;
   participantAgentId?: string;
   assigneeUserId?: string;
@@ -2522,6 +2523,7 @@ async function blockedInboxIssueConditions(
   if (touchedByUserId) conditions.push(touchedByUserCondition(companyId, touchedByUserId));
   if (inboxArchivedByUserId) conditions.push(inboxVisibleForUserCondition(companyId, inboxArchivedByUserId));
   if (unreadForUserId) conditions.push(unreadForUserCondition(companyId, unreadForUserId));
+  if (filters?.identifier) conditions.push(eq(issues.identifier, filters.identifier));
   if (filters?.projectId) conditions.push(eq(issues.projectId, filters.projectId));
   if (filters?.workspaceId) {
     conditions.push(or(
@@ -3452,6 +3454,9 @@ export function issueService(db: Db) {
       }
       if (unreadForUserId) {
         conditions.push(unreadForUserCondition(companyId, unreadForUserId));
+      }
+      if (filters?.identifier) {
+        conditions.push(eq(issues.identifier, filters.identifier));
       }
       if (filters?.projectId) conditions.push(eq(issues.projectId, filters.projectId));
       if (filters?.workspaceId) {
