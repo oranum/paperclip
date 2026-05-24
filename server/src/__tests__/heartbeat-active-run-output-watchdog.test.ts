@@ -13,6 +13,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issues,
+  routines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -106,17 +107,21 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     sourceStatus?: "in_progress" | "done" | "cancelled";
     sourceOriginKind?: string;
     sameRunTerminalEvidence?: "activity" | "comment";
+    routineExecution?: { silentByDesign: boolean };
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
     const coderId = randomUUID();
     const issueId = randomUUID();
     const runId = randomUUID();
+    const routineId = randomUUID();
     const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const startedAt = new Date(opts.now.getTime() - opts.ageMs);
     const lastOutputAt = opts.withOutput ? new Date(opts.now.getTime() - 5 * 60 * 1000) : null;
     const sourceStatus = opts.sourceStatus ?? "in_progress";
     const terminalEvidenceAt = new Date(startedAt.getTime() + 10 * 60 * 1000);
+    const originKind = opts.routineExecution ? "routine_execution" : (opts.sourceOriginKind ?? "manual");
+    const originId = opts.routineExecution ? routineId : null;
 
     await db.insert(companies).values({
       id: companyId,
@@ -149,6 +154,15 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         permissions: {},
       },
     ]);
+    if (opts.routineExecution) {
+      await db.insert(routines).values({
+        id: routineId,
+        companyId,
+        title: "Heartbeat-only routine",
+        assigneeAgentId: coderId,
+        silentByDesign: opts.routineExecution.silentByDesign,
+      });
+    }
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -158,7 +172,8 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       assigneeAgentId: coderId,
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
-      originKind: opts.sourceOriginKind ?? "manual",
+      originKind,
+      originId,
       completedAt: sourceStatus === "done" ? terminalEvidenceAt : null,
       cancelledAt: sourceStatus === "cancelled" ? terminalEvidenceAt : null,
       updatedAt: startedAt,
@@ -260,6 +275,39 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     });
     expect(evaluations[0]?.description).toContain("Decision Checklist");
     expect(evaluations[0]?.description).not.toContain("sk-test-secret-value");
+  });
+
+  it("skips silent runs for silentByDesign routine executions but still flags non-flagged ones", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const silent = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      routineExecution: { silentByDesign: true },
+    });
+    const loud = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      routineExecution: { silentByDesign: false },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const silentResult = await heartbeat.scanSilentActiveRuns({ now, companyId: silent.companyId });
+    const loudResult = await heartbeat.scanSilentActiveRuns({ now, companyId: loud.companyId });
+
+    expect(silentResult).toMatchObject({ scanned: 1, created: 0, skipped: 1 });
+    expect(loudResult).toMatchObject({ scanned: 1, created: 1 });
+
+    const silentEvaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, silent.companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(silentEvaluations).toHaveLength(0);
+
+    const loudEvaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, loud.companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(loudEvaluations).toHaveLength(1);
   });
 
   it("redacts sensitive values from actual run-log evidence", async () => {

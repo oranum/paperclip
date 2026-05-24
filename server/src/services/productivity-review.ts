@@ -9,6 +9,7 @@ import {
   issueComments,
   issues,
   projects,
+  routines,
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
@@ -380,6 +381,16 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       .then((rows) => rows[0]?.count ?? 0);
   }
 
+  async function isSilentByDesignRoutineExecution(sourceIssue: IssueRow): Promise<boolean> {
+    if (sourceIssue.originKind !== "routine_execution" || !sourceIssue.originId) return false;
+    const routine = await db
+      .select({ silentByDesign: routines.silentByDesign })
+      .from(routines)
+      .where(and(eq(routines.id, sourceIssue.originId), eq(routines.companyId, sourceIssue.companyId)))
+      .then((rows) => rows[0] ?? null);
+    return routine?.silentByDesign === true;
+  }
+
   async function collectEvidence(
     sourceIssue: IssueRow,
     sourceAgent: AgentRow,
@@ -475,7 +486,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
 
-    const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
+    // LIM-69: the no_comment_streak trigger is silence-based, so suppress it for
+    // routine executions that are silent by design. long_active_duration and
+    // high_churn are stall/churn signals and stay fully active.
+    const silentByDesign = await isSilentByDesignRoutineExecution(sourceIssue);
+    const noComment = !silentByDesign && noCommentStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||

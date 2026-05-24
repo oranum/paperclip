@@ -22,6 +22,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  routines,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -1517,6 +1518,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { kind: "created" as const, evaluationIssueId: evaluation.id };
   }
 
+  // LIM-69: silence-based watchdogs must not fire for runs that belong to a
+  // routine flagged `silentByDesign`. Stall/churn monitors stay active — this
+  // only gates the silent-run (no-output) evaluation path.
+  async function isSilentByDesignRoutineRun(companyId: string, contextSnapshot: unknown) {
+    const issueId = issueIdFromRunContext(contextSnapshot);
+    if (!issueId) return false;
+    const sourceIssue = await db
+      .select({ originKind: issues.originKind, originId: issues.originId })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!sourceIssue || sourceIssue.originKind !== "routine_execution" || !sourceIssue.originId) {
+      return false;
+    }
+    const routine = await db
+      .select({ silentByDesign: routines.silentByDesign })
+      .from(routines)
+      .where(and(eq(routines.id, sourceIssue.originId), eq(routines.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    return routine?.silentByDesign === true;
+  }
+
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
     const now = opts?.now ?? new Date();
     const suspicionBefore = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
@@ -1545,6 +1568,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     };
 
     for (const run of candidates) {
+      if (await isSilentByDesignRoutineRun(run.companyId, run.contextSnapshot)) {
+        result.skipped += 1;
+        continue;
+      }
       if (await latestActiveOutputQuietUntilDecision(run.companyId, run.id, now)) {
         result.snoozed += 1;
         continue;

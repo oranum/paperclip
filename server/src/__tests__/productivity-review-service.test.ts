@@ -9,6 +9,7 @@ import {
   heartbeatRuns,
   issueComments,
   issues,
+  routines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -55,13 +56,17 @@ describeEmbeddedPostgres("productivity review service", () => {
     startedAt?: Date;
     parentId?: string | null;
     originKind?: string;
+    routineExecution?: { silentByDesign: boolean };
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
     const coderId = randomUUID();
     const issueId = randomUUID();
+    const routineId = randomUUID();
     const issuePrefix = `PR${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const createdAt = new Date("2026-04-28T10:00:00.000Z");
+    const originKind = opts?.routineExecution ? "routine_execution" : (opts?.originKind ?? "manual");
+    const originId = opts?.routineExecution ? routineId : null;
 
     await db.insert(companies).values({
       id: companyId,
@@ -94,6 +99,15 @@ describeEmbeddedPostgres("productivity review service", () => {
         permissions: {},
       },
     ]);
+    if (opts?.routineExecution) {
+      await db.insert(routines).values({
+        id: routineId,
+        companyId,
+        title: "Silent routine",
+        assigneeAgentId: coderId,
+        silentByDesign: opts.routineExecution.silentByDesign,
+      });
+    }
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -102,7 +116,8 @@ describeEmbeddedPostgres("productivity review service", () => {
       priority: "medium",
       assigneeAgentId: coderId,
       parentId: opts?.parentId ?? null,
-      originKind: opts?.originKind ?? "manual",
+      originKind,
+      originId,
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
       startedAt: opts?.startedAt ?? createdAt,
@@ -110,7 +125,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       updatedAt: createdAt,
     });
 
-    return { companyId, managerId, coderId, issueId, issuePrefix, createdAt };
+    return { companyId, managerId, coderId, issueId, issuePrefix, createdAt, routineId };
   }
 
   async function insertRuns(input: {
@@ -120,11 +135,13 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    spacingMs?: number;
   }) {
+    const spacingMs = input.spacingMs ?? 60_000;
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
       const runId = randomUUID();
-      const createdAt = new Date(input.now.getTime() - index * 60_000);
+      const createdAt = new Date(input.now.getTime() - index * spacingMs);
       runs.push({
         id: runId,
         companyId: input.companyId,
@@ -208,6 +225,43 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment completed-run streak: 10");
 
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
+  });
+
+  it("suppresses only no_comment_streak for silentByDesign routine executions while long_active_duration still fires", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      routineExecution: { silentByDesign: true },
+    });
+    // Space runs ~7min apart so the no-comment streak (10 terminal runs) trips
+    // while staying under the high_churn hourly/six-hour thresholds, isolating
+    // the no_comment_streak signal.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      spacingMs: 7 * 60_000,
+    });
+    const service = productivityReviewService(db);
+
+    // No-comment streak alone must not produce a review for a silent-by-design routine.
+    const noCommentResult = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    expect(noCommentResult.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    // A long-active episode (>6h) on the same issue still produces a review.
+    await db
+      .update(issues)
+      .set({ startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000) })
+      .where(eq(issues.id, seeded.issueId));
+
+    const longActiveResult = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    expect(longActiveResult.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
   it("refreshes open productivity reviews only once per interval and caps refresh comments", async () => {
