@@ -1136,6 +1136,12 @@ export function agentRoutes(
 
   async function assertCanManageInstructionsPath(req: Request, targetAgent: { id: string; companyId: string }) {
     assertCompanyAccess(req, targetAgent.companyId);
+    if (req.actor.type === "agent") {
+      if (req.actor.agentId !== targetAgent.id) {
+        throw forbidden("Agent can only manage its own instructions");
+      }
+      return;
+    }
     if (req.actor.type !== "board") {
       throw forbidden(
         "Only board-authenticated callers can manage instructions path or bundle configuration",
@@ -2931,8 +2937,8 @@ export function agentRoutes(
     assertCompanyAccess(req, agent.companyId);
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
-        res.status(403).json({ error: "Agent can only invoke itself" });
+      if (req.actor.agentId !== id && agent.reportsTo !== req.actor.agentId) {
+        res.status(403).json({ error: "Agent can only invoke itself or its direct reports" });
         return;
       }
     } else {
@@ -2999,8 +3005,8 @@ export function agentRoutes(
     assertCompanyAccess(req, agent.companyId);
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
-        res.status(403).json({ error: "Agent can only invoke itself" });
+      if (req.actor.agentId !== id && agent.reportsTo !== req.actor.agentId) {
+        res.status(403).json({ error: "Agent can only invoke itself or its direct reports" });
         return;
       }
     } else {
